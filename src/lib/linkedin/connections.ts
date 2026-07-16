@@ -82,30 +82,64 @@ async function scrapeCards(page: Page): Promise<ScrapedConnection[]> {
   const rows = await page.$$eval("a[href*='/in/']", (anchors) => {
     const clean = (s: string | null | undefined): string =>
       (s ?? "").replace(/\s+/g, " ").trim();
-
-    // Nearest ancestor that looks like a whole connection card.
-    const cardOf = (a: Element): Element => {
-      const li = a.closest('[role="listitem"], li');
-      if (li) return li;
-      let node: Element | null = a;
-      for (let i = 0; i < 4 && node?.parentElement; i++) node = node.parentElement;
-      return node ?? a;
+    const slugOf = (href: string): string | null => {
+      const m = href.match(/\/in\/([^/?#]+)/);
+      return m ? m[1]! : null;
     };
 
-    const byUrl = new Map<
-      string,
-      { fullName: string; profileUrl: string; headline?: string; connectedText?: string }
-    >();
-
+    // Each connection has TWO /in/ anchors (photo + name), and rows do NOT use
+    // role="listitem". Group anchors by profile slug, then scope each person's
+    // "card" to the smallest ancestor that contains ONLY their links — walking
+    // up a fixed number of parents lands on a shared container and makes every
+    // row resolve to the first person (the "repeats the first one" bug).
+    const groups = new Map<string, HTMLAnchorElement[]>();
     for (const a of Array.from(anchors) as HTMLAnchorElement[]) {
-      const profileUrl = (a.href ?? "").split("?")[0];
-      if (!profileUrl || !profileUrl.includes("/in/")) continue;
-      if (byUrl.has(profileUrl)) continue;
+      const slug = slugOf(a.href || "");
+      if (!slug) continue;
+      if (!groups.has(slug)) groups.set(slug, []);
+      groups.get(slug)!.push(a);
+    }
 
-      const card = cardOf(a);
+    const uniqueSlugsIn = (el: Element): Set<string> => {
+      const s = new Set<string>();
+      for (const x of Array.from(el.querySelectorAll("a[href*='/in/']"))) {
+        const sl = slugOf((x as HTMLAnchorElement).href || "");
+        if (sl) s.add(sl);
+      }
+      return s;
+    };
 
-      // Name: this anchor's text, else the photo alt, else any /in/ anchor text.
-      let fullName = clean(a.textContent);
+    const results: Array<{
+      fullName: string;
+      profileUrl: string;
+      headline?: string;
+      connectedText?: string;
+    }> = [];
+
+    for (const [slug, group] of groups) {
+      const profileUrl = (group[0]!.href || "").split("?")[0];
+      if (!profileUrl.includes("/in/")) continue;
+
+      // Card = largest ancestor that still contains only THIS person's links.
+      let card: Element = group[0]!;
+      let node: Element | null = group[0]!.parentElement;
+      for (let i = 0; i < 10 && node; i++) {
+        const slugs = uniqueSlugsIn(node);
+        if (slugs.size === 1 && slugs.has(slug)) {
+          card = node;
+          node = node.parentElement;
+        } else break;
+      }
+
+      // Name: the anchor that actually has text; else the photo's alt text.
+      let fullName = "";
+      for (const a of group) {
+        const t = clean(a.textContent);
+        if (t) {
+          fullName = t;
+          break;
+        }
+      }
       if (!fullName) {
         const img = card.querySelector("img[alt]");
         fullName = clean(img?.getAttribute("alt"));
@@ -114,8 +148,14 @@ async function scrapeCards(page: Page): Promise<ScrapedConnection[]> {
         .replace(/^view\s+/i, "")
         .replace(/['’]s\s+profile.*$/i, "")
         .replace(/\s*[•·].*$/, "")
+        .replace(/\s+is\s+(open to work|hiring).*$/i, "")
         .trim();
       if (!fullName || /LinkedIn Member/i.test(fullName)) continue;
+
+      const rawLines = ((card as HTMLElement).innerText || "")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
 
       const entry: {
         fullName: string;
@@ -124,29 +164,24 @@ async function scrapeCards(page: Page): Promise<ScrapedConnection[]> {
         connectedText?: string;
       } = { fullName, profileUrl };
 
-      // Connection date: prefer <time>; else any text mentioning "connected".
+      // Connection date: <time> if present, else a line mentioning "connected".
       const timeEl = card.querySelector("time");
       let connectedText = clean(timeEl?.textContent);
       if (!connectedText) {
-        const m = clean((card as HTMLElement).innerText).match(
-          /connected[^\n]*?(ago|today|yesterday|\d{4})/i,
-        );
-        if (m) connectedText = m[0];
+        connectedText = rawLines.find((l) => /connected/i.test(l)) ?? "";
       }
       if (connectedText) entry.connectedText = connectedText;
 
-      // Headline/occupation: first visible line that isn't the name/date/action.
-      const noise = /^(•|·|connected|connect|message|following|pending)\b/i;
-      const line = ((card as HTMLElement).innerText || "")
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .find((l) => l !== fullName && !noise.test(l) && l.length > 1);
-      if (line) entry.headline = line.slice(0, 300);
+      // Occupation/headline: first line that isn't the name/date/action button.
+      const noise = /^(•|·|connected|connect|message|following|pending|remove)\b/i;
+      const occ = rawLines.find(
+        (l) => l !== fullName && !noise.test(l) && l.length > 1,
+      );
+      if (occ) entry.headline = occ.slice(0, 300);
 
-      byUrl.set(profileUrl, entry);
+      results.push(entry);
     }
-    return Array.from(byUrl.values());
+    return results;
   });
 
   return rows.map((r) => {
