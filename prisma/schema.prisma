@@ -1,0 +1,159 @@
+// Prisma schema for the LinkedIn Automation app.
+// Datasource is Postgres (Neon). DATABASE_URL uses Neon's pooled
+// connection for the app; DIRECT_URL uses the direct (non-pooled)
+// connection, which Prisma needs for migrations.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String // bcrypt hash
+  createdAt DateTime @default(now())
+}
+
+model LinkedInAccount {
+  id                String     @id @default(cuid())
+  label             String
+  email             String
+  passwordEnc       String // AES-256 encrypted
+  cookiesJson       String? // encrypted Playwright storageState
+  status            String     @default("inactive") // inactive, active, paused, captcha, banned
+  dailyConnectCount Int        @default(0)
+  dailyMessageCount Int        @default(0)
+  lastResetAt       DateTime   @default(now())
+  timezone          String     @default("UTC")
+  proxy             String?
+  createdAt         DateTime   @default(now())
+  campaigns         Campaign[]
+  activities        Activity[]
+}
+
+model Search {
+  id               String   @id @default(cuid())
+  name             String
+  keywords         String?
+  location         String?
+  industry         String?
+  currentCompany   String?
+  pastCompany      String?
+  title            String?
+  connectionDegree String? // 1st, 2nd, 3rd
+  filtersJson      String?
+  maxPages         Int      @default(5)
+  lastRunAt        DateTime?
+  resultCount      Int      @default(0)
+  createdAt        DateTime @default(now())
+  leads            Lead[]
+}
+
+model Lead {
+  id               String         @id @default(cuid())
+  searchId         String?
+  search           Search?        @relation(fields: [searchId], references: [id], onDelete: SetNull)
+  fullName         String
+  firstName        String?
+  lastName         String?
+  headline         String?
+  profileUrl       String         @unique
+  location         String?
+  company          String?
+  title            String?
+  connectionDegree String?
+  status           String         @default("new") // new, queued, connected, messaged, replied, skipped
+  notes            String?
+  connectedAt      DateTime? // when we became connected (approx, from the Connections page); null = not a known 1st-degree connection
+  importedAt       DateTime       @default(now())
+  campaignLeads    CampaignLead[]
+  activities       Activity[]
+
+  @@index([connectedAt])
+}
+
+model Template {
+  id        String   @id @default(cuid())
+  name      String
+  type      String // connection_note, message
+  body      String // supports {{firstName}} {{lastName}} {{company}} {{title}}
+  createdAt DateTime @default(now())
+}
+
+model Campaign {
+  id            String          @id @default(cuid())
+  name          String
+  accountId     String
+  account       LinkedInAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  status        String          @default("draft") // draft, running, paused, completed
+  stepsJson     String          @default("[]") // [{type, templateId, delayDays}]
+  createdAt     DateTime        @default(now())
+  startedAt     DateTime?
+  campaignLeads CampaignLead[]
+}
+
+model CampaignLead {
+  id           String    @id @default(cuid())
+  campaignId   String
+  leadId       String
+  campaign     Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  lead         Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  currentStep  Int       @default(0)
+  status       String    @default("pending") // pending, in_progress, completed, failed
+  lastError    String?
+  lastActionAt DateTime?
+  nextActionAt DateTime?
+
+  @@unique([campaignId, leadId])
+  @@index([status, nextActionAt])
+}
+
+model Activity {
+  id        String           @id @default(cuid())
+  accountId String
+  account   LinkedInAccount  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  type      String // login, search, connect_sent, message_sent, error, captcha, info
+  leadId    String?
+  lead      Lead?            @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  message   String
+  metadata  String? // JSON
+  createdAt DateTime         @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([type, createdAt])
+}
+
+model Job {
+  id         String    @id @default(cuid())
+  type       String // search, connect, message, login
+  status     String    @default("queued") // queued, running, done, failed
+  payload    String    @default("{}") // JSON args
+  accountId  String?
+  result     String?
+  error      String?
+  createdAt  DateTime  @default(now())
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  @@index([status, createdAt])
+}
+
+model Settings {
+  id                String   @id @default("singleton")
+  connectionsPerDay Int      @default(20)
+  messagesPerDay    Int      @default(50)
+  delayMinMs        Int      @default(3000)
+  delayMaxMs        Int      @default(10000)
+  profileDelayMinMs Int      @default(8000)
+  profileDelayMaxMs Int      @default(20000)
+  headless          Boolean  @default(false)
+  defaultProxy      String?
+  tosAccepted       Boolean  @default(false)
+  updatedAt         DateTime @default(now()) @updatedAt
+}

@@ -1,0 +1,57 @@
+# Optional: run the app + a self-hosted Postgres database in containers.
+# The app defaults to Neon (see .env); this file is an alternative for fully
+# local/offline Postgres. It overrides DATABASE_URL to point at the `db`
+# service below, so no DIRECT_URL is needed (the local db isn't pooled).
+#
+#   docker compose up --build
+#
+# The worker runs as its own service so automation survives web restarts.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: linkedin
+      POSTGRES_PASSWORD: linkedin
+      POSTGRES_DB: linkedin
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linkedin"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://linkedin:linkedin@db:5432/linkedin?schema=public"
+      NEXTAUTH_SECRET: "${NEXTAUTH_SECRET}"
+      NEXTAUTH_URL: "http://localhost:3000"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+    ports:
+      - "3000:3000"
+    command: sh -c "npx prisma migrate deploy && npm run start"
+
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://linkedin:linkedin@db:5432/linkedin?schema=public"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+    # Headed browser automation needs a display; run the worker on the host
+    # for interactive login/2FA. This service is best for headless operation.
+    command: sh -c "npm run worker"
+
+volumes:
+  pgdata:
