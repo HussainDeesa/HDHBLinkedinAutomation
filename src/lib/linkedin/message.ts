@@ -44,7 +44,7 @@ export async function sendMessage(
 
   try {
     await page.goto(lead.profileUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await humanDelay(2500, 5000);
+    await humanDelay(1200, 2500);
 
     if (!(await isLoggedIn(page))) return { ok: false, reason: "not_logged_in" };
     if (await anyPresent(page, SELECTORS.login.captcha)) {
@@ -62,7 +62,7 @@ export async function sendMessage(
       return { ok: false, reason: "error", detail: "Message button not found (not connected?)" };
     }
     await humanClick(page, messageBtn);
-    await humanDelay(1200, 2500);
+    await humanDelay(500, 1200);
 
     const box = await firstVisible(page, SELECTORS.message.messageBox, 6000);
     if (!box) {
@@ -71,7 +71,7 @@ export async function sendMessage(
     }
     await humanClick(page, box);
     await humanType(box, text);
-    await humanDelay(800, 1800);
+    await humanDelay(400, 900);
 
     const send = await firstVisible(page, SELECTORS.message.sendButton, 4000);
     if (!send) {
@@ -79,7 +79,7 @@ export async function sendMessage(
       return { ok: false, reason: "error", detail: "Send button not found" };
     }
     await humanClick(page, send);
-    await humanDelay(1500, 3000);
+    await humanDelay(700, 1500);
 
     // Close the conversation overlay to leave a clean state.
     const close = await firstVisible(page, SELECTORS.message.closeOverlay, 2000);

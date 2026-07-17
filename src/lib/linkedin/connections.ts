@@ -117,7 +117,7 @@ async function scrapeCards(page: Page): Promise<ScrapedConnection[]> {
     }> = [];
 
     for (const [slug, group] of groups) {
-      const profileUrl = (group[0]!.href || "").split("?")[0];
+      const profileUrl = (group[0]!.href || "").split("?")[0] ?? "";
       if (!profileUrl.includes("/in/")) continue;
 
       // Card = largest ancestor that still contains only THIS person's links.

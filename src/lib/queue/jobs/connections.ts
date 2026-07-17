@@ -63,8 +63,12 @@ export async function runMessageConnectionsJob(
 
   const headless = await getHeadless();
   const settings = await prisma.settings.findUnique({ where: { id: "singleton" } });
-  const delayMin = settings?.delayMinMs ?? 3000;
-  const delayMax = settings?.delayMaxMs ?? 10000;
+  // Batch messaging paces faster than campaigns: use ~1/3 of the configured
+  // delay, floored to a snappy 0.8-2.5s jittered gap between messages. Still
+  // randomized so it doesn't look like a fixed-interval bot. Raising these
+  // (or the Settings delays) lowers ban risk; lowering them raises it.
+  const delayMin = Math.max(800, Math.floor((settings?.delayMinMs ?? 3000) / 3));
+  const delayMax = Math.max(2500, Math.floor((settings?.delayMaxMs ?? 10000) / 3));
 
   // Newest-first so "first 50-100" matches the top of the Connections list.
   const targets = await prisma.lead.findMany({
