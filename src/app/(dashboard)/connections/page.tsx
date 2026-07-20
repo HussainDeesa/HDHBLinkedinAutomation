@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { Loader2, RefreshCw, Send, Users } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Loader2, RefreshCw, Search, Send, Users } from "lucide-react";
 
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -55,9 +56,15 @@ interface ConnectionLead {
 interface ConnectionsResponse {
   total: number;
   matching: number;
+  filtered: number;
   since: string | null;
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
   leads: ConnectionLead[];
 }
+
+const PAGE_SIZE = 50;
 
 interface MessageTemplate {
   id: string;
@@ -66,8 +73,18 @@ interface MessageTemplate {
 }
 
 const MONTHS = [
-  "January", "February", "March", "April", "May", "June",
-  "July", "August", "September", "October", "November", "December",
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
 ];
 
 const CURRENT_YEAR = new Date().getFullYear();
@@ -81,7 +98,9 @@ export default function ConnectionsPage() {
   const { toast } = useToast();
   const { data: accountsData } = useApi<AccountOption[]>("/api/accounts");
   const accounts = useMemo(() => accountsData ?? [], [accountsData]);
-  const { data: templatesData } = useApi<MessageTemplate[]>("/api/templates?type=message");
+  const { data: templatesData } = useApi<MessageTemplate[]>(
+    "/api/templates?type=message",
+  );
   const templates = useMemo(() => templatesData ?? [], [templatesData]);
 
   const [accountId, setAccountId] = useState<string>("");
@@ -91,8 +110,20 @@ export default function ConnectionsPage() {
   const [templateId, setTemplateId] = useState<string>(CUSTOM);
   const [body, setBody] = useState<string>(DEFAULT_BODY);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState<string>("");
+  const [debouncedSearch, setDebouncedSearch] = useState<string>("");
   const [syncing, setSyncing] = useState(false);
   const [sending, setSending] = useState(false);
+
+  // Accumulated, paginated connections list (infinite scroll).
+  const [leads, setLeads] = useState<ConnectionLead[]>([]);
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
+  const [total, setTotal] = useState(0);
+  const [matching, setMatching] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   // First day of the selected month, in UTC — "connected since <month>".
   const sinceIso = useMemo(
@@ -100,28 +131,90 @@ export default function ConnectionsPage() {
     [year, month],
   );
 
-  const {
-    data: conn,
-    loading,
-    refresh,
-  } = useApi<ConnectionsResponse>(
-    `/api/connections?since=${encodeURIComponent(sinceIso)}&pageSize=200`,
+  // Debounce the search box so typing doesn't fire a request per keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const loadPage = useCallback(
+    async (pageToLoad: number, replace: boolean): Promise<void> => {
+      if (replace) setLoading(true);
+      else setLoadingMore(true);
+      try {
+        const params = new URLSearchParams({
+          since: sinceIso,
+          pageSize: String(PAGE_SIZE),
+          page: String(pageToLoad),
+        });
+        if (debouncedSearch) params.set("q", debouncedSearch);
+        const res = await apiFetch<ConnectionsResponse>(
+          `/api/connections?${params.toString()}`,
+        );
+        setTotal(res.total);
+        setMatching(res.matching);
+        setHasMore(res.hasMore);
+        setPage(res.page);
+        setLeads((prev) =>
+          replace ? res.leads : [...prev, ...res.leads],
+        );
+      } catch (e) {
+        toast({
+          title: "Could not load connections",
+          description: e instanceof Error ? e.message : "Unknown error",
+          variant: "destructive",
+        });
+      } finally {
+        if (replace) setLoading(false);
+        else setLoadingMore(false);
+      }
+    },
+    [sinceIso, debouncedSearch, toast],
   );
 
-  const leads = useMemo(() => conn?.leads ?? [], [conn]);
+  // Reload from page 1 whenever the query (month/search) or a manual refresh
+  // changes. loadPage's identity already changes with sinceIso/debouncedSearch.
+  useEffect(() => {
+    void loadPage(1, true);
+  }, [loadPage, reloadNonce]);
+
+  const refresh = useCallback(() => setReloadNonce((n) => n + 1), []);
+
+  const loadMore = useCallback(() => {
+    if (loading || loadingMore || !hasMore) return;
+    void loadPage(page + 1, false);
+  }, [loading, loadingMore, hasMore, page, loadPage]);
+
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) loadMore();
+      },
+      { root: scrollRef.current, rootMargin: "200px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [loadMore]);
+
   const effectiveAccountId = accountId || accounts[0]?.id || "";
   const hasAccounts = accounts.length > 0;
-  const matching = conn?.matching ?? 0;
   const limitNum = limit === "all" ? null : Number(limit);
   const sinceLabel = `${MONTHS[Number(month)]} ${year}`;
 
   // Selection overrides the since-filter: if any rows are checked we message
   // exactly those; otherwise we message all matching since the chosen month.
   const selectedCount = selected.size;
-  const willSendAll = limitNum === null ? matching : Math.min(matching, limitNum);
+  const willSendAll =
+    limitNum === null ? matching : Math.min(matching, limitNum);
   const sendCount = selectedCount > 0 ? selectedCount : willSendAll;
 
-  const allVisibleSelected = leads.length > 0 && leads.every((l) => selected.has(l.id));
+  const allVisibleSelected =
+    leads.length > 0 && leads.every((l) => selected.has(l.id));
 
   function toggleOne(id: string): void {
     setSelected((prev) => {
@@ -133,11 +226,16 @@ export default function ConnectionsPage() {
   }
 
   function toggleAll(): void {
-    setSelected((prev) =>
-      leads.length > 0 && leads.every((l) => prev.has(l.id))
-        ? new Set()
-        : new Set(leads.map((l) => l.id)),
-    );
+    setSelected((prev) => {
+      if (leads.length > 0 && leads.every((l) => prev.has(l.id))) {
+        const next = new Set(prev);
+        for (const l of leads) next.delete(l.id);
+        return next;
+      }
+      const next = new Set(prev);
+      for (const l of leads) next.add(l.id);
+      return next;
+    });
   }
 
   function handleTemplate(value: string): void {
@@ -157,11 +255,15 @@ export default function ConnectionsPage() {
     try {
       await apiFetch<{ ok: boolean; jobId: string }>("/api/connections/sync", {
         method: "POST",
-        body: JSON.stringify({ accountId: effectiveAccountId, since: sinceIso }),
+        body: JSON.stringify({
+          accountId: effectiveAccountId,
+          since: sinceIso,
+        }),
       });
       toast({
         title: "Sync queued",
-        description: "Scraping your connections in the background. Refresh in a minute to see them.",
+        description:
+          "Scraping your connections in the background. Refresh in a minute to see them.",
       });
     } catch (e) {
       toast({
@@ -208,17 +310,24 @@ export default function ConnectionsPage() {
     setSending(true);
     try {
       const payload = useSelection
-        ? { accountId: effectiveAccountId, leadIds: [...selected], body: body.trim() }
+        ? {
+            accountId: effectiveAccountId,
+            leadIds: [...selected],
+            body: body.trim(),
+          }
         : {
             accountId: effectiveAccountId,
             since: sinceIso,
             limit: limitNum,
             body: body.trim(),
           };
-      await apiFetch<{ ok: boolean; jobId: string }>("/api/connections/message", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
+      await apiFetch<{ ok: boolean; jobId: string }>(
+        "/api/connections/message",
+        {
+          method: "POST",
+          body: JSON.stringify(payload),
+        },
+      );
       toast({
         title: "Messaging queued",
         description: `Messaging ${who}. Watch progress in Activity.`,
@@ -242,7 +351,9 @@ export default function ConnectionsPage() {
         description="Sync your existing LinkedIn connections and message specific ones or everyone connected since a chosen month."
       >
         <Button variant="outline" onClick={refresh} disabled={loading}>
-          <RefreshCw className={`mr-1.5 h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+          <RefreshCw
+            className={`mr-1.5 h-4 w-4 ${loading ? "animate-spin" : ""}`}
+          />
           Refresh
         </Button>
       </PageHeader>
@@ -376,12 +487,13 @@ export default function ConnectionsPage() {
               ) : (
                 <p>
                   <span className="font-medium">{matching}</span> connection(s)
-                  since <span className="font-medium">{sinceLabel}</span>. This run
-                  will message <span className="font-medium">{willSendAll}</span>.
+                  since <span className="font-medium">{sinceLabel}</span>. This
+                  run will message{" "}
+                  <span className="font-medium">{willSendAll}</span>.
                 </p>
               )}
               <p className="mt-1 text-xs text-muted-foreground">
-                {conn?.total ?? 0} connection(s) synced in total.
+                {total} connection(s) synced in total.
               </p>
             </div>
           </CardContent>
@@ -419,10 +531,25 @@ export default function ConnectionsPage() {
             <CardTitle>Synced connections</CardTitle>
             <CardDescription>
               Check rows to message specific people. Newest first; dates are
-              approximate (from LinkedIn&apos;s &ldquo;connected X ago&rdquo; labels).
+              approximate (from LinkedIn&apos;s &ldquo;connected X ago&rdquo;
+              labels).
             </CardDescription>
+            <div className="relative mt-2">
+              <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+              <Input
+                type="search"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search by name or headline"
+                className="pl-8"
+                aria-label="Search connections"
+              />
+            </div>
           </CardHeader>
-          <CardContent className="p-0">
+          <CardContent
+            ref={scrollRef}
+            className="p-0 max-h-[85vh] overflow-auto"
+          >
             <Table>
               <TableHeader>
                 <TableRow>
@@ -455,14 +582,20 @@ export default function ConnectionsPage() {
                   <TableRow>
                     <TableCell colSpan={5} className="h-32 text-center">
                       <p className="text-sm text-muted-foreground">
-                        No connections synced yet. Click &ldquo;Sync
-                        connections&rdquo; to pull them from LinkedIn.
+                        {debouncedSearch
+                          ? `No connections match “${debouncedSearch}”.`
+                          : "No connections synced yet. Click “Sync connections” to pull them from LinkedIn."}
                       </p>
                     </TableCell>
                   </TableRow>
                 ) : (
                   leads.map((lead) => (
-                    <TableRow key={lead.id} data-state={selected.has(lead.id) ? "selected" : undefined}>
+                    <TableRow
+                      key={lead.id}
+                      data-state={
+                        selected.has(lead.id) ? "selected" : undefined
+                      }
+                    >
                       <TableCell>
                         <Checkbox
                           checked={selected.has(lead.id)}
@@ -496,6 +629,24 @@ export default function ConnectionsPage() {
                 )}
               </TableBody>
             </Table>
+            {/* Infinite-scroll sentinel: loads the next page when it enters view. */}
+            {!loading && leads.length > 0 && (
+              <div
+                ref={sentinelRef}
+                className="flex items-center justify-center py-4 text-sm text-muted-foreground"
+              >
+                {loadingMore ? (
+                  <span className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading more…
+                  </span>
+                ) : hasMore ? (
+                  <span>Scroll to load more</span>
+                ) : (
+                  <span>All {leads.length} loaded</span>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>
