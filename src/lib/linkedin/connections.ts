@@ -4,7 +4,7 @@ import { recordActivity } from "@/lib/activity";
 import { getAccountSession, saveSession } from "@/lib/linkedin/browser";
 import { isLoggedIn } from "@/lib/linkedin/auth";
 import { SELECTORS } from "@/lib/linkedin/selectors";
-import { anyPresent, firstVisible, humanDelay, randInt } from "@/lib/linkedin/utils";
+import { anyPresent, firstVisible, humanDelay } from "@/lib/linkedin/utils";
 import { captureFailure } from "@/lib/linkedin/debug";
 import type { ScrapedConnection } from "@/types";
 
@@ -131,12 +131,17 @@ async function scrapeCards(page: Page): Promise<ScrapedConnection[]> {
         } else break;
       }
 
-      // Name: the anchor that actually has text; else the photo's alt text.
+      // Name: the anchor that actually has text. Take only its FIRST line — the
+      // name anchor often also contains the degree/occupation, and clean() would
+      // otherwise fold the whole bio into the name.
       let fullName = "";
       for (const a of group) {
-        const t = clean(a.textContent);
-        if (t) {
-          fullName = t;
+        const firstLine = ((a as HTMLElement).innerText || a.textContent || "")
+          .split("\n")
+          .map((l) => l.trim())
+          .find(Boolean);
+        if (firstLine) {
+          fullName = firstLine;
           break;
         }
       }
@@ -256,8 +261,15 @@ export async function syncConnections(
       return { ok: false, scanned: 0, saved: 0, reason: "captcha" };
     }
 
+    // The connections list is infinite-scroll: new rows load only as you reach
+    // the bottom. We repeatedly pull the last row into view (works whether the
+    // scroll container is the window or an inner element), scroll to the bottom,
+    // and click any "Show more results" button, stopping when several rounds in
+    // a row add nothing new (or we pass the date cutoff / hit `max`).
     let reachedCutoff = false;
-    for (let round = 0; round < MAX_LOAD_ROUNDS; round++) {
+    let stableRounds = 0;
+    let lastCount = 0;
+    for (let round = 0; round < MAX_LOAD_ROUNDS && stableRounds < 3; round++) {
       const cards = await scrapeCards(page);
       for (const c of cards) seen.set(c.profileUrl, c);
 
@@ -275,21 +287,31 @@ export async function syncConnections(
       }
       if (seen.size >= max) break;
 
-      // Load the next batch: click "Show more results" if present, else scroll.
-      const more = await firstVisible(page, SELECTORS.connections.loadMore, 2500);
-      const before = seen.size;
+      // Trigger the next infinite-scroll batch.
+      await page
+        .evaluate(() => {
+          const links = document.querySelectorAll("a[href*='/in/']");
+          const last = links[links.length - 1] as HTMLElement | undefined;
+          if (last) last.scrollIntoView({ block: "end" });
+          window.scrollTo(0, document.body.scrollHeight);
+        })
+        .catch(() => undefined);
+      const more = await firstVisible(page, SELECTORS.connections.loadMore, 1200);
       if (more) {
         await more.scrollIntoViewIfNeeded().catch(() => undefined);
         await more.click().catch(() => undefined);
-      } else {
-        await page.mouse.wheel(0, randInt(1200, 2200));
       }
-      await humanDelay(1500, 3000);
+      await humanDelay(1500, 2800);
 
-      // Detect end-of-list: another scrape yields nothing new.
+      // Re-scrape; growth resets the stability counter, stagnation increments it.
       const after = await scrapeCards(page);
       for (const c of after) seen.set(c.profileUrl, c);
-      if (seen.size === before && !more) break;
+      if (seen.size > lastCount) {
+        lastCount = seen.size;
+        stableRounds = 0;
+      } else {
+        stableRounds++;
+      }
     }
 
     // Persist. Preserve any existing status (don't downgrade "messaged").

@@ -12,7 +12,10 @@ export interface SyncConnectionsJobPayload {
 }
 
 export interface MessageConnectionsJobPayload {
-  since: string; // ISO date — message connections added on/after this
+  // Either target specific connections by id, OR all connections added since a
+  // date. leadIds takes precedence when present.
+  leadIds?: string[] | null;
+  since?: string | null; // ISO date — message connections added on/after this
   limit?: number | null; // cap on messages to send; null = as many as limits allow
   body: string; // supports {{firstName}} {{lastName}} {{fullName}} tokens
 }
@@ -58,8 +61,11 @@ export async function runMessageConnectionsJob(
   const body = payload.body?.trim();
   if (!body) return { ok: false, detail: "message body is required" };
 
-  const since = new Date(payload.since);
-  if (Number.isNaN(since.getTime())) return { ok: false, detail: "invalid 'since' date" };
+  const explicitIds = payload.leadIds?.filter(Boolean) ?? [];
+  const since = payload.since ? new Date(payload.since) : null;
+  if (explicitIds.length === 0 && (!since || Number.isNaN(since.getTime()))) {
+    return { ok: false, detail: "message_connections needs leadIds or a valid 'since' date" };
+  }
 
   const headless = await getHeadless();
   const settings = await prisma.settings.findUnique({ where: { id: "singleton" } });
@@ -70,22 +76,35 @@ export async function runMessageConnectionsJob(
   const delayMin = Math.max(800, Math.floor((settings?.delayMinMs ?? 3000) / 3));
   const delayMax = Math.max(2500, Math.floor((settings?.delayMaxMs ?? 10000) / 3));
 
-  // Newest-first so "first 50-100" matches the top of the Connections list.
-  const targets = await prisma.lead.findMany({
-    where: {
-      status: "connected",
-      connectedAt: { gte: since, not: null },
-    },
-    orderBy: { connectedAt: "desc" },
-    ...(payload.limit && payload.limit > 0 ? { take: payload.limit } : {}),
-    select: { id: true, fullName: true, firstName: true, lastName: true, company: true, title: true },
-  });
+  const leadSelect = {
+    id: true,
+    fullName: true,
+    firstName: true,
+    lastName: true,
+    company: true,
+    title: true,
+  } as const;
+
+  // Explicit selection wins; otherwise all connections newest-first since the
+  // cutoff, up to the optional cap.
+  const targets = explicitIds.length
+    ? await prisma.lead.findMany({ where: { id: { in: explicitIds } }, select: leadSelect })
+    : await prisma.lead.findMany({
+        where: { status: "connected", connectedAt: { gte: since!, not: null } },
+        orderBy: { connectedAt: "desc" },
+        ...(payload.limit && payload.limit > 0 ? { take: payload.limit } : {}),
+        select: leadSelect,
+      });
+
+  const scope = explicitIds.length
+    ? `${targets.length} selected connection(s)`
+    : `connection(s) added since ${payload.since!.slice(0, 10)}`;
 
   if (targets.length === 0) {
     await recordActivity({
       accountId,
       type: "info",
-      message: `No unmessaged connections found since ${payload.since.slice(0, 10)}. Try syncing connections first.`,
+      message: `No connections to message (${scope}). Try syncing connections first.`,
     });
     return { ok: true, detail: "0 matching connections" };
   }
@@ -93,7 +112,7 @@ export async function runMessageConnectionsJob(
   await recordActivity({
     accountId,
     type: "info",
-    message: `Messaging ${targets.length} connection(s) added since ${payload.since.slice(0, 10)}…`,
+    message: `Messaging ${targets.length} ${explicitIds.length ? "selected connection(s)" : `connection(s) added since ${payload.since!.slice(0, 10)}`}…`,
   });
 
   let sent = 0;
